@@ -22,7 +22,7 @@ MAX has no public API for channel posting, so tg2max drives the MAX web client (
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/tg2max.git
+git clone https://github.com/Podogrev/tg2max.git
 cd tg2max
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
