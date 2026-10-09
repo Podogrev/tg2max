@@ -1,0 +1,15 @@
+# Secrets and sessions
+.env
+*.session
+*.session-journal
+max_session.json
+
+# Local state
+*.db
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
