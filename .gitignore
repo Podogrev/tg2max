@@ -3,6 +3,7 @@
 *.session
 *.session-journal
 max_session.json
+max_token.json
 
 # Local state
 *.db

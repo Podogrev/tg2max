@@ -6,7 +6,7 @@ from typing import Optional
 import aiosqlite
 from datetime import datetime, timezone
 
-_ORIGINAL_DB = "tg2max.db"
+_ORIGINAL_DB = os.getenv("TG2MAX_DB", "tg2max.db")
 
 
 def _get_db_path() -> str:
@@ -89,3 +89,20 @@ async def get_last_migrated_id() -> Optional[int]:
         )
         row = await cur.fetchone()
         return row[0] if row and row[0] is not None else None
+
+
+async def get_meta_int(key: str) -> Optional[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+
+async def set_meta_int(key: str, value: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        await db.commit()

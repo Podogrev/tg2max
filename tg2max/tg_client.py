@@ -2,16 +2,16 @@ import asyncio
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from datetime import datetime
+from typing import Dict, Optional, Set
 
 from telethon import TelegramClient, events
 
-from tg2max.config import TG_API_ID, TG_API_HASH, TG_PHONE, TG_CHANNEL
+from tg2max.config import TG_API_ID, TG_API_HASH, TG_CHANNEL
 from tg2max import db
 from tg2max.max_client import MaxClient
-from tg2max.media import detect_media_type, download_temp
-from tg2max.formatter import tg_entities_to_markdown
+from tg2max.media import detect_media_type
+from tg2max.formatter import tg_to_max
 
 logger = logging.getLogger(__name__)
 
@@ -36,148 +36,122 @@ def create_tg_client() -> TelegramClient:
     return TelegramClient(_session_path(), TG_API_ID, TG_API_HASH)
 
 
-async def _process_message(
-    tg_client: TelegramClient,
-    max_client: MaxClient,
-    message,
-) -> None:
-    """Process a single TG message: transfer to MAX."""
-    text = tg_entities_to_markdown(message)
-    has_media = detect_media_type(message) is not None
-
-    if not text and not has_media:
-        logger.debug("Skipping empty message %d", message.id)
-        return
-
-    if has_media:
-        async with download_temp(tg_client, message) as tmp_path:
-            if tmp_path:
-                await max_client.send_media(tmp_path, caption=text)
-            elif text:
-                await max_client.send_text(text)
-    elif text:
-        await max_client.send_text(text)
-
-    await db.mark_migrated(message.id)
-    logger.info("Migrated TG msg %d → MAX", message.id)
+_SUFFIX = {"photo": ".jpg", "video": ".mp4", "animation": ".mp4"}
 
 
-async def _process_album(
-    tg_client: TelegramClient,
-    max_client: MaxClient,
-    messages: list,
-) -> None:
-    """Process an album — download all media, send as group, clean up."""
-    # Get caption from first message that has text
-    caption = ""
+async def _download(tg_client: TelegramClient, msg, tmp_dir: str) -> Optional[str]:
+    """Download photo/video of a message into tmp_dir. Other media types are skipped."""
+    kind = detect_media_type(msg)
+    if kind is None:
+        return None
+    if kind not in _SUFFIX:
+        logger.warning("Msg %d: unsupported media type %s, sending text only", msg.id, kind)
+        return None
+    path = await tg_client.download_media(msg, file=os.path.join(tmp_dir, f"{msg.id}{_SUFFIX[kind]}"))
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    logger.warning("Msg %d: media download failed", msg.id)
+    return None
+
+
+async def _send(tg_client: TelegramClient, max_client: MaxClient, messages: list) -> None:
+    """Send one TG post (single message or album) as one MAX post, then mark all as migrated."""
+    text, elements = "", []
     for msg in messages:
-        t = tg_entities_to_markdown(msg)
-        if t:
-            caption = t
+        text, elements = tg_to_max(msg)
+        if text:
             break
 
-    # Download all album media to temp files
-    tmp_paths = []
-    try:
+    with tempfile.TemporaryDirectory(prefix="tg2max-") as tmp_dir:
+        paths = []
         for msg in messages:
-            if detect_media_type(msg) is None:
-                continue
-            suffix = ".jpg" if detect_media_type(msg) == "photo" else ".mp4"
-            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-            os.close(fd)
-            path = await tg_client.download_media(msg, file=tmp_path)
-            if path and os.path.exists(path) and os.path.getsize(path) > 0:
-                tmp_paths.append(path)
-            else:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
-        if tmp_paths:
-            await max_client.send_media_group(tmp_paths, caption=caption)
-        elif caption:
-            await max_client.send_text(caption)
-    finally:
-        # Clean up all temp files
-        for p in tmp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            p = await _download(tg_client, msg, tmp_dir)
+            if p:
+                paths.append(p)
+        if not text and not paths:
+            logger.debug("Skipping empty post (msg %d)", messages[0].id)
+            return
+        max_id = await max_client.send_post(text, elements, paths)
 
     for msg in messages:
-        await db.mark_migrated(msg.id)
-    logger.info("Migrated album (%d messages) → MAX", len(messages))
+        await db.mark_migrated(msg.id, str(max_id))
+    logger.info("Migrated TG msg %s (%d media) -> MAX %s",
+                ",".join(str(m.id) for m in messages), len(paths), max_id)
 
 
-async def migrate_all(tg_client: TelegramClient, max_client: MaxClient, since_date: Optional[datetime] = None) -> None:
-    """Migrate all historical posts from TG channel to MAX, preserving order."""
+async def _process_message(tg_client: TelegramClient, max_client: MaxClient, message) -> None:
+    await _send(tg_client, max_client, [message])
+
+
+async def _process_album(tg_client: TelegramClient, max_client: MaxClient, messages: list) -> None:
+    await _send(tg_client, max_client, messages)
+
+
+class MigrationError(RuntimeError):
+    pass
+
+
+async def migrate_all(
+    tg_client: TelegramClient,
+    max_client: MaxClient,
+    since_date: Optional[datetime] = None,
+    min_id: int = 0,
+) -> int:
+    """Migrate posts newer than min_id (and not older than since_date) from TG to MAX.
+
+    Posts go strictly in chronological order. On the first failure the run stops,
+    so a later post never overtakes a failed one in MAX. Returns the highest TG message id
+    up to which everything is migrated (the resume point for the next run).
+    Raises MigrationError after saving progress if a post failed.
+    """
     await db.init_db()
 
+    # reverse=True + min_id: Telegram returns only messages after min_id, oldest first —
+    # no full-history scan. offset_date with reverse=True means "from this date on".
+    all_messages = [
+        m async for m in tg_client.iter_messages(
+            TG_CHANNEL, reverse=True, min_id=min_id, offset_date=since_date
+        )
+    ]
+    logger.info("Found %d messages in TG channel (after id %d)", len(all_messages), min_id)
+
     album_buffer: Dict[int, list] = {}
-    processed_groups: Set[int] = set()
-
-    # Collect all messages
-    all_messages = []
-    async for message in tg_client.iter_messages(TG_CHANNEL, reverse=True):
-        if since_date and message.date and message.date < since_date:
-            continue
-        all_messages.append(message)
-
-    logger.info("Found %d messages in TG channel", len(all_messages))
-
-    # Group album messages
     for msg in all_messages:
         if msg.grouped_id:
             album_buffer.setdefault(msg.grouped_id, []).append(msg)
+    total_posts = len({m.grouped_id or -m.id for m in all_messages})
 
-    # Count unique posts (albums count as 1)
-    total_posts = 0
-    seen_groups = set()
-    for msg in all_messages:
-        if msg.grouped_id:
-            if msg.grouped_id not in seen_groups:
-                seen_groups.add(msg.grouped_id)
-                total_posts += 1
-        else:
-            total_posts += 1
-
-    # Process in chronological order
-    count = 0
-    skipped = 0
+    processed_groups: Set[int] = set()
+    count = skipped = 0
+    resume_id = min_id
     for message in all_messages:
-        # Albums count as one post: only the first message of a group is considered
         if message.grouped_id:
             if message.grouped_id in processed_groups:
-                continue
+                continue  # album counts as one post: handled with its first message
             processed_groups.add(message.grouped_id)
+        post = album_buffer[message.grouped_id] if message.grouped_id else [message]
+        last_id = max(m.id for m in post)
 
         if await db.is_migrated(message.id):
             skipped += 1
+            resume_id = max(resume_id, last_id)
             continue
 
-        if message.grouped_id:
-            try:
-                await _process_album(tg_client, max_client, album_buffer[message.grouped_id])
-            except Exception as e:
-                logger.error("Failed to migrate album (msg %d): %s", message.id, e)
-                continue
-        else:
-            try:
-                await _process_message(tg_client, max_client, message)
-            except Exception as e:
-                logger.error("Failed to migrate msg %d: %s", message.id, e)
-                continue
+        try:
+            await _send(tg_client, max_client, post)
+        except Exception as e:
+            logger.error("Failed to migrate TG msg %d: %s. Stopping to keep order; "
+                         "it will be retried next run.", message.id, e)
+            raise MigrationError(f"TG msg {message.id}: {e}", resume_id) from e
 
+        resume_id = max(resume_id, last_id)
         count += 1
         if count % 10 == 0:
             logger.info("Progress: %d/%d posts migrated (%d skipped)", count, total_posts, skipped)
-
-        # Rate limiting
-        await asyncio.sleep(2)
+        await asyncio.sleep(2)  # rate limiting
 
     logger.info("Migration complete: %d posts transferred, %d skipped", count, skipped)
+    return resume_id
 
 
 async def watch(tg_client: TelegramClient, max_client: MaxClient) -> None:

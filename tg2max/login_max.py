@@ -1,50 +1,37 @@
-"""Interactive login to MAX web client.
-
-Run this once to scan the QR code and save the browser session.
-After that, tg2max can use the saved session headlessly.
+"""Log in to MAX by QR code shown right in the terminal. No browser needed.
 
 Usage: python -m tg2max.login_max
+Scan the QR with the MAX phone app. The session is saved to max_token.json.
 """
 
 import asyncio
-import logging
+import getpass
+import sys
+import uuid
 
-from playwright.async_api import async_playwright
+import qrcode
 
-from tg2max.max_client import STATE_FILE, MAX_WEB_URL
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from tg2max.max_client import SESSION_FILE, save_session
+from tg2max.max_proto import MaxConnection
 
 
-async def login():
-    pw = await async_playwright().start()
+async def show_qr(link: str) -> None:
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(link)
+    qr.print_ascii(invert=True)
+    print("\nScan the QR code with the MAX mobile app. Waiting for confirmation...", flush=True)
 
-    # Launch visible browser for QR code scanning
-    browser = await pw.chromium.launch(headless=False)
-    context = await browser.new_context(viewport={"width": 1200, "height": 800})
-    page = await context.new_page()
 
-    await page.goto(MAX_WEB_URL)
+async def ask_password(hint) -> str:
+    return getpass.getpass(f"MAX cloud password (hint: {hint}): ")
 
-    print()
-    print("=" * 50)
-    print("Open the MAX app on your phone")
-    print("and scan the QR code in the browser window.")
-    print()
-    print("After a successful login, press Enter here...")
-    print("=" * 50)
-    print()
 
-    input(">>> Press Enter after logging in to MAX: ")
-
-    # Save session
-    await context.storage_state(path=STATE_FILE)
-    logger.info("Session saved to %s", STATE_FILE)
-
-    await browser.close()
-    await pw.stop()
-    print("Done! Now run: python -m tg2max migrate")
+async def login() -> None:
+    device_id = str(uuid.uuid4())
+    async with MaxConnection(None, device_id) as conn:
+        token = await conn.qr_login(show_qr, ask_password if sys.stdin.isatty() else None)
+        save_session(token, device_id, conn.me)
+    print(f"Done: logged in as {conn.me}, session saved to {SESSION_FILE}")
 
 
 if __name__ == "__main__":
