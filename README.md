@@ -28,7 +28,7 @@ MAX's official Bot API is only available to Russian businesses and self-employed
 git clone https://github.com/Podogrev/tg2max.git
 cd tg2max
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 
 cp .env.example .env   # then fill in the values
 ```
@@ -59,6 +59,14 @@ python -m tg2max sync
 
 For a scheduled daily copy, run `python -m tg2max migrate` from cron or launchd.
 
+Optional settings (environment or `.env`, which is read from the current directory):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TG2MAX_DB` | `tg2max.db` | Path to the SQLite state DB |
+| `MAX_SESSION_FILE` | `max_token.json` | Path to the MAX session |
+| `POST_DELAY` | `0.5` | Pause between posts, seconds |
+
 ## How it works
 
 | Module | Role |
@@ -71,7 +79,7 @@ For a scheduled daily copy, run `python -m tg2max migrate` from cron or launchd.
 | `tg2max/media.py` | Detects the media type of a Telegram message |
 | `tg2max/db.py` | SQLite tracking of copied posts (`tg2max.db`) |
 
-Media files are downloaded one post at a time and deleted right after sending. Posts are sent with a 2-second pause between them.
+Posts are always sent one after another, oldest first. To save time, the media of the next post download while the current post uploads, and the files of one album download and upload in parallel (album order is kept). At most two posts' media sit on disk at once; they are deleted right after sending.
 
 The MAX side uses `wss://api.oneme.ru/websocket` with msgpack frames, as web.max.ru does. Upload hosts are signed by the Russian Trusted Root CA, so its certificate ships in `tg2max/rootca_ssl_rsa2022.crt`. The protocol details were cross-checked against [PyMax](https://github.com/MaxApiTeam/PyMax) (MIT).
 
@@ -82,6 +90,15 @@ The MAX side uses `wss://api.oneme.ru/websocket` with msgpack frames, as web.max
 - **The MAX session expires.** tg2max then exits with `MaxSessionError`; run `python -m tg2max.login_max` again.
 - Monospace and code blocks are sent, but the MAX web client currently shows them as plain text.
 - Only photos and videos are transferred as media. Voice messages, documents, polls and stickers are not supported.
+
+## Development
+
+```bash
+pip install -e '.[test]'
+pytest
+```
+
+The tests cover the protocol codec, formatting and the post-order guarantees of `migrate` and `watch` using fake clients; they never contact Telegram or MAX.
 
 ## License
 

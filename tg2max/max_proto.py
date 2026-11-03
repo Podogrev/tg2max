@@ -125,6 +125,7 @@ class MaxConnection:
         self._video_waiters: dict = {}
         self._ws = None
         self._reader = None
+        self._http: Optional[aiohttp.ClientSession] = None  # one HTTP/TLS pool for all uploads
         self._ssl = ssl.create_default_context()
         self._ssl.load_verify_locations(CA_FILE)
 
@@ -142,6 +143,10 @@ class MaxConnection:
             WS_URL, origin=ORIGIN, user_agent_header=USER_AGENT, max_size=10 * 2**20
         )
         self._reader = asyncio.create_task(self._read_loop())
+        self._http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=900, sock_read=60),
+            connector=aiohttp.TCPConnector(ssl=self._ssl),
+        )
         await self.call(OP_SESSION_INIT, {
             "userAgent": {
                 "deviceType": "WEB", "locale": "ru", "deviceLocale": "ru",
@@ -155,6 +160,8 @@ class MaxConnection:
     async def close(self) -> None:
         if self._reader:
             self._reader.cancel()
+        if self._http:
+            await self._http.close()
         if self._ws:
             await self._ws.close()
 
@@ -242,14 +249,14 @@ class MaxConnection:
         ctype = mimetypes.guess_type(path)[0] or "image/jpeg"
         with open(path, "rb") as fh:
             form.add_field("file", fh.read(), filename=os.path.basename(path), content_type=ctype)
-        async with aiohttp.ClientSession() as s, s.post(url, data=form, ssl=self._ssl) as r:
+        async with self._http.post(url, data=form) as r:
             if r.status != 200:
                 raise MaxError(f"photo upload HTTP {r.status}: {(await r.text())[:200]}")
             photos = (await r.json(content_type=None))["photos"]
         entry = photos.get(photo_id) or next(iter(photos.values()))
         return {"_type": "PHOTO", "photoToken": entry["token"]}
 
-    async def upload_video(self, path: str, timeout: float = 900) -> dict:
+    async def upload_video(self, path: str) -> dict:
         resp = await self.call(OP_VIDEO_UPLOAD, {"count": 1, "type": 0, "uploaderType": 0, "profile": False})
         info = resp["info"][0]
         video_id, token = info["videoId"], info["token"]
@@ -262,12 +269,10 @@ class MaxConnection:
             "Content-Type": "application/octet-stream",
         }
         try:
-            t = aiohttp.ClientTimeout(total=timeout, sock_read=60)
-            async with aiohttp.ClientSession(timeout=t) as s:
-                with open(path, "rb") as fh:
-                    async with s.post(info["url"], data=fh, headers=headers, ssl=self._ssl) as r:
-                        if r.status != 200:
-                            raise MaxError(f"video upload HTTP {r.status}: {(await r.text())[:200]}")
+            with open(path, "rb") as fh:
+                async with self._http.post(info["url"], data=fh, headers=headers) as r:
+                    if r.status != 200:
+                        raise MaxError(f"video upload HTTP {r.status}: {(await r.text())[:200]}")
             await asyncio.wait_for(ready, 180)
         finally:
             self._video_waiters.pop(video_id, None)

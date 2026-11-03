@@ -4,6 +4,7 @@ Talks to MAX's internal WebSocket protocol directly (see max_proto.py) — no br
 Session (login token + device id) lives in max_token.json, created by `python -m tg2max.login_max`.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_FILE = os.getenv("MAX_SESSION_FILE", "max_token.json")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".gif"}
+UPLOAD_CONCURRENCY = 3  # parallel uploads within one album
 
 
 class MaxSessionError(RuntimeError):
@@ -67,9 +69,14 @@ class MaxClient:
         file_paths: Sequence[str] = (),
     ) -> int:
         """Send one post: text with formatting and 0..N media files (N > 1 = album)."""
-        attaches: List[dict] = []
-        for p in file_paths:
-            attaches.append(await self._upload(p))
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
+        async def upload(p: str) -> dict:
+            async with sem:
+                return await self._upload(p)
+
+        # gather keeps input order, so album items stay in the Telegram order
+        attaches: List[dict] = list(await asyncio.gather(*(upload(p) for p in file_paths)))
         msg_id = await self._conn.send_message(self.chat_id, text, elements, attaches)
         logger.debug("Sent post %s: %d attachments", msg_id, len(attaches))
         return msg_id

@@ -64,6 +64,7 @@ async def run(mode: str, since_date=None, explicit_since: bool = False) -> None:
     finally:
         await max_client.close()
         await tg_client.disconnect()
+        await db.close_db()
 
 
 def main():

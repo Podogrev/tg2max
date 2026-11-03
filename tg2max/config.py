@@ -1,7 +1,8 @@
 import os
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-load_dotenv()
+# .env from the current working directory (not next to the installed package)
+load_dotenv(find_dotenv(usecwd=True))
 
 
 def _require(name: str) -> str:
@@ -22,3 +23,6 @@ try:
     TG_CHANNEL = int(TG_CHANNEL)
 except ValueError:
     pass
+
+# Pause between posts, seconds. MAX allows ~2 send operations per second per chat.
+POST_DELAY = float(os.getenv("POST_DELAY", "0.5"))
